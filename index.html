@@ -64,6 +64,8 @@
         <li>снимайте сверху, без бликов, документ на весь кадр</li>
       </ul>
     </div>
+    <p id="desktop-note" class="card hint hidden">💻 Камера открывается, когда сканер запущен в Telegram
+      на телефоне. На компьютере выберите готовое фото СТС.</p>
     <button id="shoot">📷 Сфотографировать СТС</button>
     <button id="pick" class="secondary">🖼 Выбрать фото из галереи</button>
     <input id="cam" type="file" accept="image/*" capture="environment">
@@ -82,6 +84,8 @@
       бот спросит их позже.</p>
     <form id="form" onsubmit="return false"></form>
     <button id="send">✅ Отправить в бот</button>
+    <details class="card hint"><summary>Что прочитал сканер (текст остаётся в телефоне)</summary>
+      <pre id="raw" style="white-space:pre-wrap;font-size:12px;margin:8px 0 0"></pre></details>
     <button id="again" class="secondary">📷 Переснять</button>
   </section>
 
@@ -95,6 +99,18 @@ const FIELDS = [
 const tg = window.Telegram && Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 const $ = (id) => document.getElementById(id);
+
+// На компьютере браузер не открывает камеру по кнопке, а показывает выбор файла.
+// Поэтому там прячем «Сфотографировать» и объясняем, что камера работает на телефоне.
+const platform = (tg && tg.platform) || "";
+const isMobile = ["ios", "android", "android_x"].includes(platform) ||
+  (!platform || platform === "unknown") && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+if (!isMobile) {
+  $("shoot").classList.add("hidden");
+  $("desktop-note").classList.remove("hidden");
+  $("pick").classList.remove("secondary");
+  $("pick").textContent = "🖼 Выбрать фото СТС";
+}
 const show = (id) => ["start", "busy", "result"].forEach((s) => $(s).classList.toggle("hidden", s !== id));
 let worker = null, ptsKind = "";
 
@@ -103,7 +119,6 @@ async function getWorker() {
   worker = await Tesseract.createWorker(["rus", "eng"], 1, {
     logger: (m) => {
       if (m.status === "recognizing text") {
-        $("status").textContent = "Распознаём текст…";
         $("progress").style.width = Math.round(m.progress * 100) + "%";
       } else if (/load/.test(m.status)) {
         $("status").textContent = "Загружаем словари…";
@@ -113,29 +128,52 @@ async function getWorker() {
   return worker;
 }
 
-// Уменьшаем и переводим в ч/б. Контраст не усиливаем: в тестах это иногда портило VIN
-// (Z читалась как 7), а пустое поле лучше ошибочного
+// Два варианта снимка для двух проходов распознавания:
+// 1) обычный ч/б. Контраст не усиливаем: в тестах это иногда портило VIN (Z читалась как 7);
+// 2) «без сетки»: берём самый светлый из трёх цветов пикселя. Чёрный текст остаётся тёмным,
+//    а розово-зелёная защитная сетка СТС становится почти белой. Потом чёткий порог (Оцу).
 function prepare(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, 2000 / Math.max(img.width, img.height));
-      const c = document.createElement("canvas");
-      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
-      const ctx = c.getContext("2d");
-      ctx.drawImage(img, 0, 0, c.width, c.height);
+      const scale = Math.min(1, 2200 / Math.max(img.width, img.height));
+      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+      const make = () => { const c = document.createElement("canvas"); c.width = w; c.height = h;
+                           const x = c.getContext("2d"); x.drawImage(img, 0, 0, w, h); return [c, x]; };
+      const [gray, gx] = make(), [clean, cx] = make();
       URL.revokeObjectURL(url);
-      const d = ctx.getImageData(0, 0, c.width, c.height), p = d.data;
+      const g = gx.getImageData(0, 0, w, h), p = g.data;
       for (let i = 0; i < p.length; i += 4) {
         p[i] = p[i + 1] = p[i + 2] = 0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2];
       }
-      ctx.putImageData(d, 0, 0);
-      resolve(c);
+      gx.putImageData(g, 0, 0);
+      const c = cx.getImageData(0, 0, w, h), q = c.data, hist = new Array(256).fill(0);
+      for (let i = 0; i < q.length; i += 4) {
+        const v = Math.max(q[i], q[i + 1], q[i + 2]);
+        q[i] = v; hist[v]++;
+      }
+      const t = otsu(hist, q.length / 4);
+      for (let i = 0; i < q.length; i += 4) q[i] = q[i + 1] = q[i + 2] = q[i] > t ? 255 : 0;
+      cx.putImageData(c, 0, 0);
+      resolve([gray, clean]);
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Не удалось открыть фото")); };
     img.src = url;
   });
+}
+
+function otsu(hist, total) {
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, best = 0, t = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF, between = wB * wF * (mB - mF) ** 2;
+    if (between > best) { best = between; t = i; }
+  }
+  return t;
 }
 
 async function handle(file) {
@@ -143,12 +181,16 @@ async function handle(file) {
   show("busy");
   $("progress").style.width = "0";
   try {
-    const canvas = await prepare(file);
+    const [gray, clean] = await prepare(file);
     const w = await getWorker();
-    const { data } = await w.recognize(canvas);
-    canvas.width = canvas.height = 0;  // освобождаем изображение
-    const found = StsParse.parseSts(data.text);
+    $("status").textContent = "Распознаём текст (1 из 2)…";
+    const r1 = (await w.recognize(gray)).data.text;
+    $("status").textContent = "Распознаём текст (2 из 2)…";
+    const r2 = (await w.recognize(clean)).data.text;
+    gray.width = gray.height = clean.width = clean.height = 0;  // освобождаем изображения
+    const found = StsParse.merge(StsParse.parseSts(r1), StsParse.parseSts(r2));
     ptsKind = found.pts_kind || "";
+    $("raw").textContent = "== проход 1 ==\n" + r1 + "\n\n== проход 2 ==\n" + r2;
     render(found);
   } catch (e) {
     show("start");
