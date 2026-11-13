@@ -9,7 +9,8 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net https://telegram.org; worker-src 'self' blob: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; form-action 'none'">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-<script src="sts_parse.js"></script>
+<!-- ?v= меняется при каждом обновлении sts_parse.js, иначе телефон берёт старую копию -->
+<script src="sts_parse.js?v=2026-11-13-3"></script>
 <style>
   :root {
     --bg: var(--tg-theme-bg-color, #ffffff);
