@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Сканер СТС</title>
+<!-- Страница никуда не отправляет фото: сеть разрешена только для загрузки распознавателя
+     (cdn.jsdelivr.net) и словарей (tessdata.projectnaptha.com). Аналитики нет. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net https://telegram.org; worker-src 'self' blob: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; form-action 'none'">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="sts_parse.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #7a7a7a);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --card: var(--tg-theme-secondary-bg-color, #f2f3f5);
+    --warn: #c77700;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: var(--tg-theme-bg-color, #17212b); --text: var(--tg-theme-text-color, #f5f5f5);
+      --hint: var(--tg-theme-hint-color, #8b9aa7); --card: var(--tg-theme-secondary-bg-color, #232e3c);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; margin: 4px 0 8px; }
+  p { margin: 0 0 12px; }
+  .hint { color: var(--hint); font-size: 14px; }
+  .card { background: var(--card); border-radius: 12px; padding: 12px 14px; margin: 12px 0; }
+  button { width: 100%; border: 0; border-radius: 10px; padding: 14px; font-size: 16px; font-weight: 600;
+           background: var(--accent); color: var(--accent-text); margin: 6px 0; cursor: pointer; }
+  button.secondary { background: var(--card); color: var(--accent); }
+  button:disabled { opacity: .5; }
+  input[type=file] { display: none; }
+  label.f { display: block; font-size: 13px; color: var(--hint); margin: 10px 0 3px; }
+  input.v { width: 100%; padding: 10px; font-size: 16px; border-radius: 8px; border: 1px solid var(--hint);
+            background: var(--bg); color: var(--text); }
+  input.v.empty { border-color: var(--warn); }
+  .bar { height: 6px; background: var(--card); border-radius: 3px; overflow: hidden; margin: 8px 0; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .hidden { display: none; }
+  ul { margin: 6px 0 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+  <h1>📷 Сканер СТС</h1>
+
+  <section id="start">
+    <p>Сфотографируйте <b>сторону СТС с данными машины</b>: там VIN, марка, цвет и госномер.</p>
+    <div class="card hint">
+      🔒 Фото не покидает ваш телефон: текст распознаётся прямо здесь, а в бот уходят только
+      данные машины, которые вы проверите на следующем шаге. ФИО и адрес владельца не передаются.
+    </div>
+    <div class="card hint">
+      Советы для точности:
+      <ul>
+        <li>положите СТС на ровный тёмный фон</li>
+        <li>снимайте сверху, без бликов, документ на весь кадр</li>
+      </ul>
+    </div>
+    <button id="shoot">📷 Сфотографировать СТС</button>
+    <button id="pick" class="secondary">🖼 Выбрать фото из галереи</button>
+    <input id="cam" type="file" accept="image/*" capture="environment">
+    <input id="gal" type="file" accept="image/*">
+  </section>
+
+  <section id="busy" class="hidden">
+    <p id="status">Готовим распознавание…</p>
+    <div class="bar"><i id="progress"></i></div>
+    <p class="hint">Первый раз загружаются словари, это до 20 секунд. Дальше быстрее.</p>
+  </section>
+
+  <section id="result" class="hidden">
+    <p id="summary"></p>
+    <p class="hint">Проверьте каждое поле по документу. Пустые поля подсвечены: впишите их или оставьте пустыми,
+      бот спросит их позже.</p>
+    <form id="form" onsubmit="return false"></form>
+    <button id="send">✅ Отправить в бот</button>
+    <button id="again" class="secondary">📷 Переснять</button>
+  </section>
+
+<script>
+const FIELDS = [
+  ["model", "Марка, модель"], ["year", "Год выпуска"], ["vin", "VIN"],
+  ["plate", "Госномер"], ["category", "Тип ТС, категория"], ["color", "Цвет"],
+  ["body", "Номер кузова"], ["chassis", "Номер шасси (рамы)"],
+  ["pts", "ЭПТС или ПТС: номер"], ["sts", "СТС: серия и номер"],
+];
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const $ = (id) => document.getElementById(id);
+const show = (id) => ["start", "busy", "result"].forEach((s) => $(s).classList.toggle("hidden", s !== id));
+let worker = null, ptsKind = "";
+
+async function getWorker() {
+  if (worker) return worker;
+  worker = await Tesseract.createWorker(["rus", "eng"], 1, {
+    logger: (m) => {
+      if (m.status === "recognizing text") {
+        $("status").textContent = "Распознаём текст…";
+        $("progress").style.width = Math.round(m.progress * 100) + "%";
+      } else if (/load/.test(m.status)) {
+        $("status").textContent = "Загружаем словари…";
+      }
+    },
+  });
+  return worker;
+}
+
+// Уменьшаем и переводим в ч/б. Контраст не усиливаем: в тестах это иногда портило VIN
+// (Z читалась как 7), а пустое поле лучше ошибочного
+function prepare(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 2000 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      const d = ctx.getImageData(0, 0, c.width, c.height), p = d.data;
+      for (let i = 0; i < p.length; i += 4) {
+        p[i] = p[i + 1] = p[i + 2] = 0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2];
+      }
+      ctx.putImageData(d, 0, 0);
+      resolve(c);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Не удалось открыть фото")); };
+    img.src = url;
+  });
+}
+
+async function handle(file) {
+  if (!file) return;
+  show("busy");
+  $("progress").style.width = "0";
+  try {
+    const canvas = await prepare(file);
+    const w = await getWorker();
+    const { data } = await w.recognize(canvas);
+    canvas.width = canvas.height = 0;  // освобождаем изображение
+    const found = StsParse.parseSts(data.text);
+    ptsKind = found.pts_kind || "";
+    render(found);
+  } catch (e) {
+    show("start");
+    alert("Не получилось распознать: " + e.message);
+  }
+}
+
+function render(found) {
+  const form = $("form");
+  form.innerHTML = "";
+  let n = 0;
+  for (const [key, label] of FIELDS) {
+    const val = found[key] || "";
+    if (val) n++;
+    const l = document.createElement("label");
+    l.className = "f"; l.textContent = label + (key === "pts" && ptsKind ? (ptsKind === "epts" ? " (ЭПТС)" : " (ПТС)") : "");
+    const i = document.createElement("input");
+    i.className = "v" + (val ? "" : " empty"); i.name = key; i.value = val;
+    i.placeholder = "не распознано"; i.autocomplete = "off";
+    i.oninput = () => i.classList.toggle("empty", !i.value.trim());
+    form.append(l, i);
+  }
+  $("summary").innerHTML = n ? `Найдено полей: <b>${n} из ${FIELDS.length}</b>.`
+    : "Ничего не нашлось. Попробуйте переснять при хорошем свете или впишите поля вручную.";
+  // В СТС кузов обычно равен VIN. Если различаются, одно из них распознано с ошибкой
+  if (found.vin && found.body && found.body.length === 17 && found.vin !== found.body) {
+    $("summary").innerHTML += "<br>⚠️ <b>VIN и номер кузова различаются.</b> Сверьте оба посимвольно с документом.";
+    for (const k of ["vin", "body"]) $("form").elements[k].classList.add("empty");
+  }
+  show("result");
+}
+
+$("shoot").onclick = () => $("cam").click();
+$("pick").onclick = () => $("gal").click();
+$("cam").onchange = (e) => { handle(e.target.files[0]); e.target.value = ""; };
+$("gal").onchange = (e) => { handle(e.target.files[0]); e.target.value = ""; };
+$("again").onclick = () => show("start");
+
+$("send").onclick = () => {
+  const out = {};
+  for (const [key] of FIELDS) {
+    const v = $("form").elements[key].value.trim().slice(0, 80);
+    if (v) out[key] = v;
+  }
+  if (out.pts) out.pts_kind = /^\d{15}/.test(out.pts.replace(/\s/g, "")) ? "epts" : (ptsKind || "paper");
+  // ещё раз только белый список: на всякий случай, если форма когда-то изменится
+  const safe = Object.fromEntries(Object.entries(out).filter(([k]) => StsParse.ALLOWED.includes(k)));
+  if (tg && tg.sendData) tg.sendData(JSON.stringify(safe));
+  else alert("Откройте сканер из бота в Telegram.\n\n" + JSON.stringify(safe, null, 2));
+};
+
+// Самопроверка без камеры: ?selftest=<путь к картинке>. Результат пишется в заголовок страницы.
+const selftest = new URLSearchParams(location.search).get("selftest");
+if (selftest) fetch(selftest).then((r) => r.blob()).then(async (b) => {
+  await handle(new File([b], "t.png"));
+  const r = {};
+  for (const [key] of FIELDS) { const v = $("form").elements[key]?.value; if (v) r[key] = v; }
+  document.title = "SELFTEST " + JSON.stringify(r);
+});
+</script>
+</body>
+</html>
