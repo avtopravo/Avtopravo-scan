@@ -71,6 +71,15 @@
   const VIN_RE = /(?<![A-Z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Z0-9])/g;
   const vinOk = (v) => /[A-Z]/.test(v) && /\d/.test(v);
 
+  const TRANSLIT = { A: 1, B: 2, C: 3, D: 4, E: 5, F: 6, G: 7, H: 8, J: 1, K: 2, L: 3, M: 4, N: 5,
+                     P: 7, R: 9, S: 2, T: 3, U: 4, V: 5, W: 6, X: 7, Y: 8, Z: 9 };
+  const WEIGHTS = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2];
+  function checkDigitOk(v) {
+    const sum = [...v].reduce((n, c, i) => n + (/\d/.test(c) ? +c : TRANSLIT[c] || 0) * WEIGHTS[i], 0);
+    const r = sum % 11;
+    return (r === 10 ? "X" : String(r)) === v[8];
+  }
+
   function findVin(ls) {
     const labelled = ls.findIndex((l) => /VIN|Идентиф/i.test(l));
     const order = labelled >= 0 ? [labelled, labelled + 1, ...ls.keys()] : [...ls.keys()];
@@ -140,7 +149,7 @@
 
   function findPlate(text) {
     const ls = lines(text);
-    const byLabel = plateFrom(after(ls, "регистрационныйзнак"));
+    const byLabel = plateFrom(after(ls, "регистрационныйзнак")) || plateFrom(after(ls, "регистрационныйномер"));
     if (byLabel) return byLabel;
     for (const l of ls) {
       // не ищем номер внутри строк с VIN, ПТС и номером СТС: там тоже буквы и цифры подряд
@@ -296,9 +305,34 @@
   // проходов и посимвольно выбираем то, что встречается чаще. Ошибку в одном прочтении
   // исправляют другие. Заодно узнаём, в каких строках стоит VIN: так заполняются кузов и шасси.
   function voteVin(allLines) {
-    const reads = [];
+    // Прочтения VIN: целые «слова» из 17 символов. raw0 это первый символ до исправлений:
+    // распознаватель читает J в начале VIN как I, а I мы превращаем в 1.
+    // Проверяем и всю строку без пробелов (VIN бывает разорван пробелом), и каждое слово
+    // отдельно (иначе VIN прилипает к соседнему слову: «РАПА»+«JMB…», «VIN»+«1M8…»)
+    const collect = (line, i, extra) => {
+      const out = [], seen = new Set();
+      for (const part of [line, ...line.split(/\s+/)]) {
+        const raw = toLatin(part).replace(/[\s-]/g, ""), fixed = fixVinChars(part);
+        for (const m of fixed.matchAll(VIN_RE)) {
+          if (vinOk(m[0]) && !seen.has(m[0])) {
+            seen.add(m[0]);
+            out.push({ v: m[0], line: i, raw0: raw[m.index], extra });
+          }
+        }
+      }
+      return out;
+    };
+    let reads = [];
+    allLines.forEach((l, i) => { reads.push(...collect(l, i, false)); });
+    if (!reads.length) return null;
+    // Дополнительные прочтения из строк с мусорными значками (¥JMB…§3): значки убираем.
+    // Берём их только если они похожи на уже найденный VIN, чтобы не склеить чужие слова.
     allLines.forEach((l, i) => {
-      for (const m of fixVinChars(l).match(VIN_RE) || []) if (vinOk(m)) reads.push({ v: m, line: i });
+      const stripped = l.replace(/[^A-Za-zА-Яа-яЁё0-9\s-]/g, "");
+      if (stripped === l) return;
+      for (const r of collect(stripped, i, true)) {
+        if (reads.some((x) => !x.extra && hamming(x.v, r.v) <= 3)) reads.push(r);
+      }
     });
     if (!reads.length) return null;
     // самая большая группа похожих прочтений (отличаются не больше чем в 3 символах)
@@ -316,6 +350,11 @@
       vin += Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a] ||
         (labelled && b === labelled.v[i]) - (labelled && a === labelled.v[i]))[0];
     }
+    // Первый символ «1» из прочитанной «I»: если VIN с единицей не проходит контрольную цифру
+    // (у американских VIN она обязательна), значит это была J (японские, JMB = Mitsubishi)
+    if (vin[0] === "1" && best.some((r) => /[IL|J]/.test(r.raw0)) && !checkDigitOk(vin)) {
+      vin = "J" + vin.slice(1);
+    }
     return { vin, lines: [...new Set(best.map((r) => r.line))], reads: best.length };
   }
 
@@ -325,16 +364,29 @@
   };
 
   // Разбор двух проходов распознавания вместе
-  function parseBoth(t1, t2) {
+  // t3 это проход в режиме «разрозненный текст»: строки в нём перемешаны, поэтому
+  // из него берём только госномер, а VIN, кузов и шасси считаем по первым двум проходам
+  function parseBoth(t1, t2, t3 = "") {
     const out = merge(parseSts(t1), parseSts(t2));
+    if (!out.plate && t3) {
+      const plate = findPlate(t3);
+      if (plate) out.plate = plate;
+    }
     const l1 = lines(t1), l2 = lines(t2), all = [...l1, ...l2];
+    const explicit = { body: out.body === "ОТСУТСТВУЕТ", chassis: out.chassis === "ОТСУТСТВУЕТ" };
     const vote = voteVin(all);
     if (!vote) return out;
     out.vin = vote.vin;
     // строки, где стоит VIN: с подписью «Кузов» → кузов, с подписью «Шасси»/«Рама» → шасси
-    const vinLines = vote.lines.map((i) => all[i]);
-    if (vinLines.some((l) => hasLabel(l, "кузов"))) out.body = vote.vin;
-    if (vinLines.some((l) => hasLabel(l, "шасси") || /рама/i.test(toCyr(l)))) out.chassis = vote.vin;
+    // подпись бывает в той же строке, что и номер, или строкой выше
+    const near = (i) => [all[i], i > 0 ? all[i - 1] : ""];
+    const isChassis = (l) => hasLabel(l, "шасси") || /ра[мп]а/i.test(toCyr(l));
+    const isBody = (l) => hasLabel(l, "кузов");
+    for (const i of vote.lines) {
+      const [cur, prev] = near(i);
+      if (isBody(cur) || (!isChassis(cur) && isBody(prev))) out.body = vote.vin;
+      if (isChassis(cur) || (!isBody(cur) && isChassis(prev))) out.chassis = vote.vin;
+    }
     // подписи не прочитались, но VIN повторяется: в одном проходе 3 раза значит VIN, кузов и шасси
     const perPass = (ls) => ls.filter((l) => (fixVinChars(l).match(VIN_RE) || [])
       .some((m) => hamming(m, vote.vin) <= 3)).length;
@@ -344,11 +396,12 @@
     // ранее найденные кузов/шасси, похожие на VIN, приводим к исправленному VIN
     for (const k of ["body", "chassis"]) {
       if (out[k] && out[k].length === 17 && hamming(out[k], vote.vin) <= 3) out[k] = vote.vin;
+      if (explicit[k]) out[k] = "ОТСУТСТВУЕТ";  // явное «ОТСУТСТВУЕТ» по подписи главнее догадок
     }
     return out;
   }
 
-  const api = { parseSts, parseBoth, merge, ALLOWED: ["vin", "plate", "model", "year", "category", "color", "body",
+  const api = { parseSts, parseBoth, merge, checkDigitOk, ALLOWED: ["vin", "plate", "model", "year", "category", "color", "body",
                                            "chassis", "pts_kind", "pts", "sts"] };
   if (typeof module !== "undefined") module.exports = api;
   else root.StsParse = api;

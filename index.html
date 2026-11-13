@@ -187,10 +187,20 @@ async function handle(file) {
     const r1 = (await w.recognize(gray)).data.text;
     $("status").textContent = "Распознаём текст (2 из 2)…";
     const r2 = (await w.recognize(clean)).data.text;
+    let found = StsParse.parseBoth(r1, r2), r3 = "";
+    // Госномер на СТС напечатан отдельно и крупно, обычный режим его иногда пропускает.
+    // Тогда третий проход в режиме «разрозненный текст» (PSM 11), только если номер не нашёлся.
+    if (!found.plate || new URLSearchParams(location.search).has("pass3")) {
+      $("status").textContent = "Ищем госномер…";
+      await w.setParameters({ tessedit_pageseg_mode: "11" });
+      r3 = (await w.recognize(gray)).data.text;
+      await w.setParameters({ tessedit_pageseg_mode: "3" });
+      found = StsParse.parseBoth(r1, r2, r3);
+    }
     gray.width = gray.height = clean.width = clean.height = 0;  // освобождаем изображения
-    const found = StsParse.parseBoth(r1, r2);
     ptsKind = found.pts_kind || "";
-    $("raw").textContent = "== проход 1 ==\n" + r1 + "\n\n== проход 2 ==\n" + r2;
+    $("raw").textContent = "== проход 1 ==\n" + r1 + "\n\n== проход 2 ==\n" + r2 +
+      (r3 ? "\n\n== проход 3 (госномер) ==\n" + r3 : "");
     render(found);
   } catch (e) {
     show("start");
