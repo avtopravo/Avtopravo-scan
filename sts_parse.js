@@ -122,12 +122,33 @@
     return "";
   }
 
-  function findPlate(text) {
-    const L = `[${PLATE_LETTERS}]`;
-    const m = text.toUpperCase().match(new RegExp(`(${L})\\s?(\\d{3})\\s?(${L})\\s?(${L})\\s?(\\d{2,3})(?!\\d)`));
+  // Госномер «К566АВ997». Распознаватель путает О и 0, разрывает номер пробелами и чертами,
+  // склеивает его с подписью. Поэтому ищем по шаблону с допуском и потом приводим в порядок.
+  const PL_L = "АВЕКМНОРСТУХABEKMHOPCTYX0О";          // в буквенных местах 0 это буква О
+  const PL_D = "0-9OОбЗ";                              // в цифровых: О это 0, б это 6, З это 3
+  const PLATE_RE = new RegExp(`([${PL_L}])([${PL_D}]{3})([${PL_L}]{2})([${PL_D}]{2,3})(?![0-9])`);
+
+  function plateFrom(line) {
+    const s = line.toUpperCase().replace(/[\s|.,'’"_-]/g, "").replace(/RUS$/, "");
+    const m = s.match(PLATE_RE);
     if (!m) return "";
-    const cyr = (c) => LAT2CYR[c] || c;
-    return cyr(m[1]) + m[2] + cyr(m[3]) + cyr(m[4]) + m[5];
+    const L = (c) => (c === "0" ? "О" : LAT2CYR[c] || c);
+    const D = (c) => ({ O: "0", О: "0", б: "6", Б: "6", З: "3" }[c] || c);
+    const digits = (g) => [...g].map(D).join("");
+    return L(m[1]) + digits(m[2]) + L(m[3][0]) + L(m[3][1]) + digits(m[4]);
+  }
+
+  function findPlate(text) {
+    const ls = lines(text);
+    const byLabel = plateFrom(after(ls, "регистрационныйзнак"));
+    if (byLabel) return byLabel;
+    for (const l of ls) {
+      // не ищем номер внутри строк с VIN, ПТС и номером СТС: там тоже буквы и цифры подряд
+      if (/VIN|Идентиф|Паспорт|Кузов|Шасси/i.test(l) || (fixVinChars(l).match(VIN_RE) || []).length) continue;
+      const p = plateFrom(l);
+      if (p) return p;
+    }
+    return "";
   }
 
   const YEAR_RE = /(?<!\d)(19[5-9]\d|20[0-3]\d)(?!\d)/;
@@ -251,6 +272,7 @@
 
     if (model) out.model = model;
     if (year) out.year = year;
+    type = type.replace(/[^А-Яа-яЁёA-Za-z ,-]/g, "").replace(/\s+/g, " ").trim();
     if (type || catLat) out.category = [type, catLat].filter(Boolean).join(", ");
     if (color) out.color = color.toLowerCase();
     if (body) out.body = body;
@@ -267,7 +289,66 @@
     return out;
   }
 
-  const api = { parseSts, merge, ALLOWED: ["vin", "plate", "model", "year", "category", "color", "body",
+  const hamming = (a, b) => [...a].reduce((n, c, i) => n + (c !== b[i] ? 1 : 0), 0);
+
+  // VIN в СТС напечатан до трёх раз: в строке VIN, в «Кузов» и в «Шасси». Каждое прочтение
+  // может содержать ошибку (J прочитана как 1 и т. п.), поэтому собираем все прочтения из обоих
+  // проходов и посимвольно выбираем то, что встречается чаще. Ошибку в одном прочтении
+  // исправляют другие. Заодно узнаём, в каких строках стоит VIN: так заполняются кузов и шасси.
+  function voteVin(allLines) {
+    const reads = [];
+    allLines.forEach((l, i) => {
+      for (const m of fixVinChars(l).match(VIN_RE) || []) if (vinOk(m)) reads.push({ v: m, line: i });
+    });
+    if (!reads.length) return null;
+    // самая большая группа похожих прочтений (отличаются не больше чем в 3 символах)
+    let best = [];
+    for (const r of reads) {
+      const group = reads.filter((x) => hamming(x.v, r.v) <= 3);
+      if (group.length > best.length) best = group;
+    }
+    let vin = "";
+    for (let i = 0; i < 17; i++) {
+      const cnt = {};
+      for (const r of best) cnt[r.v[i]] = (cnt[r.v[i]] || 0) + 1;
+      // при равенстве голосов побеждает прочтение из строки с подписью VIN
+      const labelled = best.find((r) => /VIN|Идентиф/i.test(allLines[r.line]));
+      vin += Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a] ||
+        (labelled && b === labelled.v[i]) - (labelled && a === labelled.v[i]))[0];
+    }
+    return { vin, lines: [...new Set(best.map((r) => r.line))], reads: best.length };
+  }
+
+  const hasLabel = (line, label) => {
+    const pat = toCyr(label).replace(/[^а-я]/g, "");
+    return fuzzyEnd(squash(line).sq, pat, pat.length <= 5 ? 1 : 2) >= 0;
+  };
+
+  // Разбор двух проходов распознавания вместе
+  function parseBoth(t1, t2) {
+    const out = merge(parseSts(t1), parseSts(t2));
+    const l1 = lines(t1), l2 = lines(t2), all = [...l1, ...l2];
+    const vote = voteVin(all);
+    if (!vote) return out;
+    out.vin = vote.vin;
+    // строки, где стоит VIN: с подписью «Кузов» → кузов, с подписью «Шасси»/«Рама» → шасси
+    const vinLines = vote.lines.map((i) => all[i]);
+    if (vinLines.some((l) => hasLabel(l, "кузов"))) out.body = vote.vin;
+    if (vinLines.some((l) => hasLabel(l, "шасси") || /рама/i.test(toCyr(l)))) out.chassis = vote.vin;
+    // подписи не прочитались, но VIN повторяется: в одном проходе 3 раза значит VIN, кузов и шасси
+    const perPass = (ls) => ls.filter((l) => (fixVinChars(l).match(VIN_RE) || [])
+      .some((m) => hamming(m, vote.vin) <= 3)).length;
+    const times = Math.max(perPass(l1), perPass(l2));
+    if (times >= 2 && (!out.body || out.body.length === 17)) out.body = vote.vin;
+    if (times >= 3 && (!out.chassis || out.chassis.length === 17)) out.chassis = vote.vin;
+    // ранее найденные кузов/шасси, похожие на VIN, приводим к исправленному VIN
+    for (const k of ["body", "chassis"]) {
+      if (out[k] && out[k].length === 17 && hamming(out[k], vote.vin) <= 3) out[k] = vote.vin;
+    }
+    return out;
+  }
+
+  const api = { parseSts, parseBoth, merge, ALLOWED: ["vin", "plate", "model", "year", "category", "color", "body",
                                            "chassis", "pts_kind", "pts", "sts"] };
   if (typeof module !== "undefined") module.exports = api;
   else root.StsParse = api;

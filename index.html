@@ -188,7 +188,7 @@ async function handle(file) {
     $("status").textContent = "Распознаём текст (2 из 2)…";
     const r2 = (await w.recognize(clean)).data.text;
     gray.width = gray.height = clean.width = clean.height = 0;  // освобождаем изображения
-    const found = StsParse.merge(StsParse.parseSts(r1), StsParse.parseSts(r2));
+    const found = StsParse.parseBoth(r1, r2);
     ptsKind = found.pts_kind || "";
     $("raw").textContent = "== проход 1 ==\n" + r1 + "\n\n== проход 2 ==\n" + r2;
     render(found);
